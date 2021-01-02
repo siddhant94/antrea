@@ -34,6 +34,7 @@ import (
 	"github.com/vmware-tanzu/antrea/pkg/agent/util/ipset"
 	"github.com/vmware-tanzu/antrea/pkg/agent/util/iptables"
 	"github.com/vmware-tanzu/antrea/pkg/ovs/ovsconfig"
+	"github.com/vmware-tanzu/antrea/pkg/signals"
 	"github.com/vmware-tanzu/antrea/pkg/util/env"
 )
 
@@ -115,14 +116,44 @@ func (c *Client) Initialize(nodeConfig *config.NodeConfig, done func()) error {
 func (c *Client) initIPTablesOnce(done func()) {
 	defer done()
 	backoffTime := 2 * time.Second
+	// this will block until initIPTables() runs successfully
+	c.initIPtablesWithRetry(backoffTime)
+	klog.Info("Initialized iptables")
+
+	//NOTE: Alternative go wait.Until(fn, 5*time.Second, wait.NeverStop)
+	stopCh := signals.RegisterSignalHandlers()
+	go c.ipTablesSyncLoop(stopCh)
+	return //TODO: redundant, can remove
+}
+func (c *Client) initIPtablesWithRetry(backoffTime time.Duration) {
 	for {
 		if err := c.initIPTables(); err != nil {
 			klog.Errorf("Failed to initialize iptables: %v - will retry in %v", err, backoffTime)
 			time.Sleep(backoffTime)
 			continue
 		}
-		klog.Info("Initialized iptables")
 		return
+	}
+}
+
+func (c *Client) ipTablesSyncLoop(stopCh <-chan struct{}) {
+	defer klog.Infof("Stopping syncIptables")
+	syncTicker := time.NewTicker(10 * time.Second)
+	defer syncTicker.Stop()
+	//FIXME: 
+	for {
+		select {
+		case <-stopCh:
+			return // stopCh closed (because of signal handlers)
+		case <-syncTicker.C:
+			// Check is performed against both iptables & ip6tables depending which are enabled.
+			//TODO: Test for ipset also.
+			if ok := c.ipt.CheckIfAntreaRulesPresent(); !ok {
+				klog.Infof("Missing Antrea iptables rule(s). Proceeding to re-initialize iptables.")
+				c.initIPtablesWithRetry(4 * time.Second)
+			}
+			klog.Infof("All Antrea iptables rules present")
+		}
 	}
 }
 
@@ -173,12 +204,13 @@ func (c *Client) writeEKSMangleRule(iptablesData *bytes.Buffer) {
 	// it does exist we can scan for the mark value and use that in our
 	// rule.
 	klog.V(2).Infof("Add iptable mangle rule for EKS to ensure correct reverse path for NodePort Service traffic")
-	writeLine(iptablesData, []string{
-		"-A", antreaMangleChain,
+	rs := []string {
 		"-m", "comment", "--comment", `"Antrea: AWS, primary ENI"`,
 		"-i", c.nodeConfig.GatewayConfig.Name, "-j", "CONNMARK",
 		"--restore-mark", "--nfmask", "0x80", "--ctmask", "0x80",
-	}...)
+	}
+	writeLine(iptablesData, append([]string{"-A", antreaMangleChain}, rs...)...)
+	c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.MangleTable, Chain: antreaMangleChain, Command: "-A", Rule: rs })
 }
 
 // initIPTables ensure that the iptables infrastructure we use is set up.
@@ -194,6 +226,7 @@ func (c *Client) initIPTables() error {
 	// Create the antrea managed chains and link them to built-in chains.
 	// We cannot use iptables-restore for these jump rules because there
 	// are non antrea managed rules in built-in chains.
+	//NOTE: Can move all the rules in one place.
 	jumpRules := []struct{ table, srcChain, dstChain, comment string }{
 		{iptables.RawTable, iptables.PreRoutingChain, antreaPreRoutingChain, "Antrea: jump to Antrea prerouting rules"},
 		{iptables.RawTable, iptables.OutputChain, antreaOutputChain, "Antrea: jump to Antrea output rules"},
@@ -209,6 +242,9 @@ func (c *Client) initIPTables() error {
 		if err := c.ipt.EnsureRule(rule.table, rule.srcChain, ruleSpec); err != nil {
 			return err
 		}
+		// Pass "-A" i.e. append command as EnsureRule internally uses this to "ensure" rule.
+		c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: rule.table, Chain: rule.srcChain, Command: "-A", Rule: ruleSpec })
+		// { rule.table, rule.srcChain, "-A", ruleSpec}
 	}
 
 	// Use iptables-restore to configure IPv4 settings.
@@ -232,6 +268,7 @@ func (c *Client) initIPTables() error {
 }
 
 func (c *Client) restoreIptablesData(podCIDR *net.IPNet, podIPSet string) *bytes.Buffer {
+	var rs []string
 	// Create required rules in the antrea chains.
 	// Use iptables-restore as it flushes the involved chains and creates the desired rules
 	// with a single call, instead of string matching to clean up stale rules.
@@ -252,20 +289,26 @@ func (c *Client) restoreIptablesData(podCIDR *net.IPNet, podIPSet string) *bytes
 			udpPort = vxlanPort
 		}
 		if udpPort > 0 {
-			writeLine(iptablesData, []string{
-				"-A", antreaPreRoutingChain,
+			rs = []string{ 
 				"-m", "comment", "--comment", `"Antrea: do not track incoming encapsulation packets"`,
 				"-m", "udp", "-p", "udp", "--dport", strconv.Itoa(udpPort),
 				"-m", "addrtype", "--dst-type", "LOCAL",
 				"-j", iptables.NoTrackTarget,
-			}...)
-			writeLine(iptablesData, []string{
-				"-A", antreaOutputChain,
+			}
+			writeLine(iptablesData, append([]string{"-A", antreaPreRoutingChain}, rs...)...)
+			c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.RawTable, Chain: antreaPreRoutingChain, Command: "-A", Rule: rs })
+			// { iptables.RawTable, antreaPreRoutingChain, "-A", rs }
+
+			
+			rs = []string{
 				"-m", "comment", "--comment", `"Antrea: do not track outgoing encapsulation packets"`,
 				"-m", "udp", "-p", "udp", "--dport", strconv.Itoa(udpPort),
 				"-m", "addrtype", "--src-type", "LOCAL",
 				"-j", iptables.NoTrackTarget,
-			}...)
+			}
+			writeLine(iptablesData, append([]string{"-A", antreaOutputChain}, rs...)...)
+			c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.RawTable, Chain: antreaOutputChain, Command: "-A", Rule: rs})
+			// { iptables.RawTable, antreaOutputChain, "-A", rs}
 		}
 	}
 	writeLine(iptablesData, "COMMIT")
@@ -283,29 +326,36 @@ func (c *Client) restoreIptablesData(podCIDR *net.IPNet, podIPSet string) *bytes
 
 	writeLine(iptablesData, "*filter")
 	writeLine(iptablesData, iptables.MakeChainLine(antreaForwardChain))
-	writeLine(iptablesData, []string{
-		"-A", antreaForwardChain,
+	rs = []string{
 		"-m", "comment", "--comment", `"Antrea: accept packets from local pods"`,
 		"-i", hostGateway,
 		"-j", iptables.AcceptTarget,
-	}...)
-	writeLine(iptablesData, []string{
-		"-A", antreaForwardChain,
+	}
+	writeLine(iptablesData, append([]string{ "-A", antreaForwardChain}, rs...)...)
+	c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.FilterTable, Chain: antreaForwardChain, Command: "-A", Rule: rs})
+	// { iptables.FilterTable, antreaForwardChain, "-A", rs}
+
+	rs = []string {
 		"-m", "comment", "--comment", `"Antrea: accept packets to local pods"`,
 		"-o", hostGateway,
 		"-j", iptables.AcceptTarget,
-	}...)
+	}
+	writeLine(iptablesData, append([]string{ "-A", antreaForwardChain}, rs...)...)
+	c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.FilterTable, Chain: antreaForwardChain, Command: "-A", Rule: rs })
+	// { iptables.FilterTable, antreaForwardChain, "-A", rs }
 	writeLine(iptablesData, "COMMIT")
 
 	writeLine(iptablesData, "*nat")
 	writeLine(iptablesData, iptables.MakeChainLine(antreaPostRoutingChain))
 	if !c.noSNAT {
-		writeLine(iptablesData, []string{
-			"-A", antreaPostRoutingChain,
+		rs = []string {
 			"-m", "comment", "--comment", `"Antrea: masquerade pod to external packets"`,
 			"-s", podCIDR.String(), "-m", "set", "!", "--match-set", podIPSet, "dst",
 			"-j", iptables.MasqueradeTarget,
-		}...)
+		}
+		writeLine(iptablesData, append([]string{"-A", antreaPostRoutingChain}, rs...)...)
+		c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.NATTable, Chain: antreaPostRoutingChain, Command: "-A", Rule: rs })
+		// { iptables.NATTable, antreaPostRoutingChain, "-A", rs }
 	}
 	writeLine(iptablesData, "COMMIT")
 	return iptablesData

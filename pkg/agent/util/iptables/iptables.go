@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/blang/semver"
@@ -53,10 +54,17 @@ const (
 // iptables-restore: support acquiring the lock.
 var restoreWaitSupportedMinVersion = semver.Version{Major: 1, Minor: 6, Patch: 2}
 
+// Syntax: iptables [-t <table-name>] <command> <chain-name> <parameter-1> <option-1> <parameter-n> <option-n>
+type RuleInfo struct { //TODO: change name maybe, libnetwork uses similar
+	Table, Chain, Command	string
+	Rule					[]string
+}
 type Client struct {
 	ipts []*iptables.IPTables
 	// restoreWaitSupported indicates whether iptables-restore (or ip6tables-restore) supports --wait flag.
 	restoreWaitSupported bool
+	// syncRules updates to store antrea modified/applied rules in iptables. Updates via AddToSyncRules()
+	syncRules []RuleInfo
 }
 
 func New(enableIPV4, enableIPV6 bool) (*Client, error) {
@@ -199,4 +207,49 @@ func contains(chains []string, targetChain string) bool {
 
 func MakeChainLine(chain string) string {
 	return fmt.Sprintf(":%s - [0:0]", chain)
+}
+
+func (c *Client) AddToSyncRules(r RuleInfo) {
+	c.syncRules = append(c.syncRules, r)
+}
+
+func (c *Client) CheckIfAntreaRulesPresent() bool {
+	var err error
+	for idx := range c.ipts {
+		ipt := c.ipts[idx]
+		
+		t := make(map[string]map[string][]string)
+		for _, rule := range c.syncRules {
+	
+			if _, ok := t[rule.Table]; !ok {
+				// i.e. we have not queried for that particular table chain combo
+				t[rule.Table] = make(map[string][]string)
+			}
+			if _, ok := t[rule.Table][rule.Chain]; !ok {
+				t[rule.Table][rule.Chain], err = ipt.List(rule.Table, rule.Chain)
+				if err != nil {
+					// fmt.Printf("Could not list iptables rules for %s chain in %s table ", rule.Chain, rule.Table)
+					klog.Errorf("Failed to list iptables rules for %s/%s (Table/Chain)", rule.Chain, rule.Table)
+					//TODO: Check to see if we should return error
+				}
+			}
+			var target strings.Builder
+			target.WriteString(rule.Command)
+			target.WriteString(" ")
+			target.WriteString(rule.Chain)
+			for _, v := range rule.Rule {
+				target.WriteString(" ") //delimitter
+				target.WriteString(v)
+			}
+			if exists := contains(t[rule.Table][rule.Chain], target.String()); !exists {
+				// TODO: log which rule not present.
+				// klog.Infof("Failed to find rule in iptables for Table/Chain - %s/%s,\nRule: %v", rule.Table, rule.Chain, rule.Rule)
+				fmt.Printf("\nRules present %s table, %s chain -\n%+v\n", rule.Table, rule.Chain, t[rule.Table][rule.Chain])
+				fmt.Println("Target Rule: " + target.String())
+				return false
+			}
+
+		}
+	}
+	return true
 }
