@@ -61,7 +61,7 @@ func (d *agentDumper) dumpIPTables(basedir string) error {
 	if err != nil {
 		return err
 	}
-	data, err := c.Save()
+	data, err := c.Save(true)
 	if err != nil {
 		return err
 	}

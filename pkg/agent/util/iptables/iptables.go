@@ -17,6 +17,7 @@
 package iptables
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"os/exec"
@@ -57,8 +58,12 @@ var restoreWaitSupportedMinVersion = semver.Version{Major: 1, Minor: 6, Patch: 2
 // Syntax: iptables [-t <table-name>] <command> <chain-name> <parameter-1> <option-1> <parameter-n> <option-n>
 type RuleInfo struct { //TODO: change name maybe, libnetwork uses similar
 	Table, Chain, Command	string
-	Rule					[]string
+	Params					[]string
 }
+var (
+	commitBytes = "COMMIT"
+	spaceBytes  = " "
+)
 type Client struct {
 	ipts []*iptables.IPTables
 	// restoreWaitSupported indicates whether iptables-restore (or ip6tables-restore) supports --wait flag.
@@ -175,9 +180,11 @@ func (c *Client) Restore(data []byte, flush bool, useIPv6 bool) error {
 	return nil
 }
 
-// Save calls iptables-saves to dump chains and tables in iptables.
-func (c *Client) Save() ([]byte, error) {
-	var output []byte
+// Save calls iptables-saves to dump chains and tables in iptables. Argument determines whether `-c`
+// flag(include counters) will be used with iptables-save cmd.
+func (c *Client) Save(countersFlag bool) ([]byte, error) {
+	var output, data []byte
+	var err error
 	for idx := range c.ipts {
 		var cmd string
 		ipt := c.ipts[idx]
@@ -187,7 +194,11 @@ func (c *Client) Save() ([]byte, error) {
 		default:
 			cmd = "iptables-save"
 		}
-		data, err := exec.Command(cmd, "-c").CombinedOutput()
+		if countersFlag {
+			data, err = exec.Command(cmd, "-c").CombinedOutput()
+		} else {
+			data, err = exec.Command(cmd).CombinedOutput()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -213,43 +224,139 @@ func (c *Client) AddToSyncRules(r RuleInfo) {
 	c.syncRules = append(c.syncRules, r)
 }
 
-func (c *Client) CheckIfAntreaRulesPresent() bool {
-	var err error
-	for idx := range c.ipts {
-		ipt := c.ipts[idx]
-		
-		t := make(map[string]map[string][]string)
-		for _, rule := range c.syncRules {
-	
-			if _, ok := t[rule.Table]; !ok {
-				// i.e. we have not queried for that particular table chain combo
-				t[rule.Table] = make(map[string][]string)
-			}
-			if _, ok := t[rule.Table][rule.Chain]; !ok {
-				t[rule.Table][rule.Chain], err = ipt.List(rule.Table, rule.Chain)
-				if err != nil {
-					// fmt.Printf("Could not list iptables rules for %s chain in %s table ", rule.Chain, rule.Table)
-					klog.Errorf("Failed to list iptables rules for %s/%s (Table/Chain)", rule.Chain, rule.Table)
-					//TODO: Check to see if we should return error
-				}
-			}
-			var target strings.Builder
-			target.WriteString(rule.Command)
-			target.WriteString(" ")
-			target.WriteString(rule.Chain)
-			for _, v := range rule.Rule {
-				target.WriteString(" ") //delimitter
-				target.WriteString(v)
-			}
-			if exists := contains(t[rule.Table][rule.Chain], target.String()); !exists {
-				// TODO: log which rule not present.
-				// klog.Infof("Failed to find rule in iptables for Table/Chain - %s/%s,\nRule: %v", rule.Table, rule.Chain, rule.Rule)
-				fmt.Printf("\nRules present %s table, %s chain -\n%+v\n", rule.Table, rule.Chain, t[rule.Table][rule.Chain])
-				fmt.Println("Target Rule: " + target.String())
-				return false
-			}
+func PrettyPrint(v interface{}) (err error) {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err == nil {
+			fmt.Println(string(b))
+	}
+	return
+}
 
+func (c *Client) CheckIfAntreaRulesPresent() bool {
+	// iptablesBuf := bytes.NewBuffer(nil)
+	// iptData := iptablesBuf.Bytes()
+	ipTablesData, err := c.Save(false)
+	if err != nil {
+		klog.Error("Error in querying iptables: %v",err)
+		return false //TODO: return error also along with bool
+	}
+	// We parse for each table.
+	// TODO: Dont parse all tables only those which have antrea rules while being set
+	res := parseIPTablesSave(ipTablesData)
+	PrettyPrint(res)
+
+	// Loop through syncRules
+	for _, val := range c.syncRules {
+		
+		klog.Info("Table: %s, Chain: %s, Rule: %v", val.Table, val.Chain, val.Params)
+		if _, ok := res[val.Chain+"/"+val.Table]; !ok {
+			klog.Infof("\nIptables SAVE data does not have rules for %s/%s\n", val.Chain, val.Command)
+			continue //TODO: Change to return false
 		}
+		rules := res[val.Chain+"/"+val.Table]
+		klog.Info("\nRules from Iptables SAVE:\n")
+		klog.Infoln(rules)
+		present := false
+		for ix := range rules {
+			present = sameStringSlice(strings.Split(rules[ix], " "), val.Params)
+		}
+		if present != true{
+			continue //TODO: Change to return false
+		}
+		klog.Infoln("Found Rule")
+		
 	}
 	return true
 }
+
+func parseIPTablesSave(data []byte) map[string][]string {
+	chainsMap := make(map[string][]string)
+	tableToChainMap := make(map[string][]string)
+	tablePrefix := "*"
+	bytesReader := bytes.NewReader(data)
+	bufReader := bufio.NewReader(bytesReader)
+	scanner := bufio.NewScanner(bufReader)
+	klog.Infoln("Printing Scanner loop")
+	// count := 0
+	for scanner.Scan() {
+		// if count == 4 { break }
+		line := scanner.Text()
+		// fmt.Println(line)
+		// TODO: To separate IPv4 & v6, we would parse "Generated by" comment part.
+		if line[0] == '#' || strings.HasPrefix(line, commitBytes) { //comments or COMMIT's from iptables-save
+			continue
+		}
+		// Get to table line
+		var tblName string
+		//var rules []string
+		if tableNameIndex := strings.Index(line, tablePrefix); tableNameIndex != -1 {
+			// Found table line
+			tblName = line[(tableNameIndex+1):]
+			// count++
+			// Reset rules []string. PS: Change into bytes buffer and call native Reset( method.
+			continue
+		} else if line[0] == ':' && len(line) > 1 { // i.e. is a chain line
+			// We assume that the <line> contains space - chain lines have 3 fields,
+			// space delimited. If there is no space, this line will panic.
+			spaceIndex := strings.Index(line, spaceBytes)
+			if spaceIndex == -1 {
+				// TODO: Remove panic and handle error
+				panic(fmt.Sprintf("Unexpected chain line in iptables-save output: %v", string(line)))
+			}
+			chain := line[1:spaceIndex]
+			tableToChainMap[tblName] = append(tableToChainMap[tblName], chain)
+			continue
+			// TODO: Add logic to see if we need this chain, then only we'll parse
+		} else if line[0] == '-' { // Rule line
+			//TODO: Separate these into target source op etc
+			// Refer: man iptables
+			// COMMANDS: -A(append), -N (new chain), -X(delete)
+			// -A has arguments Chain RuleSpec
+			//cmd := line[0:2]
+			segments := strings.SplitN(line, spaceBytes, 3) // assuming space
+			//fmt.Printf("\nSegments: \nCmd: %s\nChain: %s\nRuleSpec: %v\n", segments[0], segments[1], segments[2])
+			key := segments[1] + "/" + tblName
+			chainsMap[key] = append(chainsMap[key], line)
+		}
+	}
+	return chainsMap
+}
+
+func sameStringSlice(x, y []string) bool {
+    if len(x) != len(y) {
+        return false
+    }
+    // create a map of string -> int
+    diff := make(map[string]int, len(x))
+    for _, _x := range x {
+        // 0 value for int is 0, so just increment a counter for the string
+        diff[_x]++
+    }
+    for _, _y := range y {
+        // If the string _y is not in diff bail out early
+        if _, ok := diff[_y]; !ok {
+            return false
+        }
+        diff[_y] -= 1
+        if diff[_y] == 0 {
+            delete(diff, _y)
+        }
+    }
+    if len(diff) == 0 {
+        return true
+    }
+    return false
+}
+
+// for _, rule := range c.syncRules {
+// 	exist, err := ipt.Exists(rule.Table, rule.Chain, rule.Rule...)
+// 	if err != nil {
+// 		//TODO: Change to klog.Error
+// 		fmt.Errorf("error checking if rule %v exists in table %s chain %s: %v", rule.Rule, rule.Table, rule.Chain, err)
+// 		return false
+// 	}
+// 	if !exist {
+// 		klog.Infof("Could not find rulespec in table %s chain %s: %v", rule.Table, rule.Chain, rule.Rule)
+// 		return false
+// 	}
+// }

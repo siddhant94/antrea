@@ -136,6 +136,7 @@ func (c *Client) initIPtablesWithRetry(backoffTime time.Duration) {
 	}
 }
 
+// This is meant to be run as a goroutine
 func (c *Client) ipTablesSyncLoop(stopCh <-chan struct{}) {
 	defer klog.Infof("Stopping syncIptables")
 	syncTicker := time.NewTicker(10 * time.Second)
@@ -151,6 +152,7 @@ func (c *Client) ipTablesSyncLoop(stopCh <-chan struct{}) {
 			if ok := c.ipt.CheckIfAntreaRulesPresent(); !ok {
 				klog.Infof("Missing Antrea iptables rule(s). Proceeding to re-initialize iptables.")
 				c.initIPtablesWithRetry(4 * time.Second)
+				break
 			}
 			klog.Infof("All Antrea iptables rules present")
 		}
@@ -210,7 +212,7 @@ func (c *Client) writeEKSMangleRule(iptablesData *bytes.Buffer) {
 		"--restore-mark", "--nfmask", "0x80", "--ctmask", "0x80",
 	}
 	writeLine(iptablesData, append([]string{"-A", antreaMangleChain}, rs...)...)
-	c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.MangleTable, Chain: antreaMangleChain, Command: "-A", Rule: rs })
+	c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.MangleTable, Chain: antreaMangleChain, Command: "-A", Params: rs })
 }
 
 // initIPTables ensure that the iptables infrastructure we use is set up.
@@ -243,7 +245,7 @@ func (c *Client) initIPTables() error {
 			return err
 		}
 		// Pass "-A" i.e. append command as EnsureRule internally uses this to "ensure" rule.
-		c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: rule.table, Chain: rule.srcChain, Command: "-A", Rule: ruleSpec })
+		c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: rule.table, Chain: rule.srcChain, Command: "-A", Params: ruleSpec })
 		// { rule.table, rule.srcChain, "-A", ruleSpec}
 	}
 
@@ -296,7 +298,7 @@ func (c *Client) restoreIptablesData(podCIDR *net.IPNet, podIPSet string) *bytes
 				"-j", iptables.NoTrackTarget,
 			}
 			writeLine(iptablesData, append([]string{"-A", antreaPreRoutingChain}, rs...)...)
-			c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.RawTable, Chain: antreaPreRoutingChain, Command: "-A", Rule: rs })
+			c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.RawTable, Chain: antreaPreRoutingChain, Command: "-A", Params: rs })
 			// { iptables.RawTable, antreaPreRoutingChain, "-A", rs }
 
 			
@@ -307,7 +309,7 @@ func (c *Client) restoreIptablesData(podCIDR *net.IPNet, podIPSet string) *bytes
 				"-j", iptables.NoTrackTarget,
 			}
 			writeLine(iptablesData, append([]string{"-A", antreaOutputChain}, rs...)...)
-			c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.RawTable, Chain: antreaOutputChain, Command: "-A", Rule: rs})
+			c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.RawTable, Chain: antreaOutputChain, Command: "-A", Params: rs })
 			// { iptables.RawTable, antreaOutputChain, "-A", rs}
 		}
 	}
@@ -332,7 +334,7 @@ func (c *Client) restoreIptablesData(podCIDR *net.IPNet, podIPSet string) *bytes
 		"-j", iptables.AcceptTarget,
 	}
 	writeLine(iptablesData, append([]string{ "-A", antreaForwardChain}, rs...)...)
-	c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.FilterTable, Chain: antreaForwardChain, Command: "-A", Rule: rs})
+	c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.FilterTable, Chain: antreaForwardChain, Command: "-A", Params: rs })
 	// { iptables.FilterTable, antreaForwardChain, "-A", rs}
 
 	rs = []string {
@@ -341,7 +343,7 @@ func (c *Client) restoreIptablesData(podCIDR *net.IPNet, podIPSet string) *bytes
 		"-j", iptables.AcceptTarget,
 	}
 	writeLine(iptablesData, append([]string{ "-A", antreaForwardChain}, rs...)...)
-	c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.FilterTable, Chain: antreaForwardChain, Command: "-A", Rule: rs })
+	c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.FilterTable, Chain: antreaForwardChain, Command: "-A", Params: rs })
 	// { iptables.FilterTable, antreaForwardChain, "-A", rs }
 	writeLine(iptablesData, "COMMIT")
 
@@ -354,7 +356,7 @@ func (c *Client) restoreIptablesData(podCIDR *net.IPNet, podIPSet string) *bytes
 			"-j", iptables.MasqueradeTarget,
 		}
 		writeLine(iptablesData, append([]string{"-A", antreaPostRoutingChain}, rs...)...)
-		c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.NATTable, Chain: antreaPostRoutingChain, Command: "-A", Rule: rs })
+		c.ipt.AddToSyncRules(iptables.RuleInfo{ Table: iptables.NATTable, Chain: antreaPostRoutingChain, Command: "-A", Params: rs })
 		// { iptables.NATTable, antreaPostRoutingChain, "-A", rs }
 	}
 	writeLine(iptablesData, "COMMIT")
